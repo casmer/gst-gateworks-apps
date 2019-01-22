@@ -37,8 +37,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include <gst/gst.h>
+#include <gst/gstelement.h>
 #include <gst/rtsp-server/rtsp-server.h>
 #include <glib.h>
 
@@ -94,6 +99,8 @@
 enum {pipeline=0, source, caps, encoder, protocol, sink};
 #define NUM_ELEM (source + sink)
 
+
+
 struct stream_info {
 	gint num_cli;		      /* Number of clients */
 	GMainLoop *main_loop;	      /* Main loop pointer */
@@ -103,6 +110,7 @@ struct stream_info {
 	GstRTSPMediaFactory *factory; /* RTSP Factory */
 	GstRTSPMedia *media;	      /* RTSP Media */
 	GstElement **stream;	      /* Array of elements */
+	char * userpipeline;
 	gboolean connected;	      /* Flag to see if this is in use */
 	gchar *video_in;	      /* Video in device */
 	gint config_interval;	      /* RTP Send Config Interval */
@@ -115,12 +123,18 @@ struct stream_info {
 	gint max_bitrate;	      /* Max Bitrate */
 	gint curr_bitrate;	      /* Current Bitrate */
 	gint msg_rate;		      /* In Seconds */
+	gchar* command_pipe;   /* command-pipe */
+	gchar* status_pipe;   /* status-pipe */
+	gint command_pipe_fd; /* command-pipe file descriptor */
+	gint status_pipe_fd;  /* status-pipe file descriptor */
 };
 
 /* Global Variables */
+static struct stream_info info = {0};
+
 static unsigned int g_dbg = 0;
 
-#define dbg(lvl, fmt, ...) _dbg (__func__, __LINE__, lvl, fmt, ##__VA_ARGS__)
+#define dbg(lvl, fmt, ...) _dbg (__func__, __LINE__, lvl, fmt "\n", ##__VA_ARGS__)
 void _dbg(const char *func, unsigned int line,
 	  unsigned int lvl, const char *fmt, ...)
 {
@@ -134,12 +148,150 @@ void _dbg(const char *func, unsigned int line,
 	}
 }
 
+static void process_command(char command[256], int len, struct stream_info *si)
+{
+	//mutex_lock();
+	dbg(0, " Command: %s", command);
+	char action[256]="";
+	char elementName[256]="";
+	char padName[256]="";
+	char paramName[256]="";
+	char paramValue[256]="";
+	const char *ptr[5];
+	char catme[2];
+	catme[1]=0;
+	ptr[0] = (const char *)&action;
+	ptr[1] = (const char *)&elementName;
+	ptr[2] = (const char *)&padName;
+	ptr[3] = (const char *)&paramName;
+	ptr[4] = (const char *)&paramValue;
+	double value;
+	GstElement* gstElement = NULL;
+
+	int delimeter=0;
+	for (int i =0; i < len; i++)
+	{
+		catme[0] = command[i];
+		if (strcmp(catme, ":")==0 || strcmp(catme, "\n")==0)
+			delimeter++;
+		else if (delimeter <= 4)
+		{
+			strcat((char*)ptr[delimeter], catme);
+		} else {
+			dbg(0, "extra character: %s", catme);
+		}
+	}
+
+	dbg(0, "action: [%s], element: [%s], padName: [%s], paramName: [%s], paramValue: [%s]",
+			action, elementName, padName, paramName, paramValue);
+
+	if (delimeter < 4)
+	{
+	dbg(0, "not enough values: %s", delimeter);
+	}
+    if (strcmp(action, "setparam")==0)
+    {
+    	if (si->connected==FALSE)
+    	{
+    		dbg(0, "not connected, nothing to do.");
+    		return;
+    	} else {
+    		dbg(0, "Connected! Lets do this!");
+    	}
+
+    	dbg(0, "getting pipeline");
+		/* Check gstreamer pipeline */
+
+		if (si->stream[pipeline] == NULL)
+		{
+			dbg(0, "ERROR: pipeline element not populated, is there a stream running?");
+			return;
+		}
+
+		/* Get gstreamer element to modify*/
+		dbg(0, "get element: [%s]", elementName);
+		gstElement = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]), elementName);
+
+		if (gstElement == NULL)
+		{
+			dbg(0, "ERROR: Failed getting the element name = %s", elementName);
+		}
+		/* Get pad to set value one*/
+		dbg(0, "get pad");
+		GstPad *gstPad = NULL;
+
+		if (strcmp(padName, "")==0)
+		{
+			dbg(1, "No Pad provided, setting element property.");
+
+		} else {
+			gstPad	= gst_element_get_static_pad(gstElement, padName);
+			if(gstPad == NULL)
+			{
+				gst_object_unref(gstElement);
+				dbg(0, "Failed to get static pad %s", padName);
+				return;
+			}
+		}
+		/* Set pad parameter */
+		GValue param = G_VALUE_INIT;
+		g_value_init(&param, G_TYPE_DOUBLE);
+		dbg(0, "parsing value");
+		value = atof(paramValue);
+		g_value_set_double(&param, value);
+		dbg(0, "setting property");
+		if (gstPad!=NULL){
+			g_object_set_property((GObject*)gstPad, paramName, &param);
+
+			/* Finished so unreference the pad*/
+			gst_object_unref(gstPad);
+		} else
+		{
+			g_object_set_property((GObject*)gstElement, paramName, &param);
+		}
+		/* Finished so unreference the element*/
+		gst_object_unref(gstElement);
+    } else {
+    	dbg(0, "Undefined action %s", action);
+    }
+}
+
+static gboolean reader(struct stream_info *si)
+{
+	char    ch_buffer[256];
+	int pos=0;
+	int result= 1;
+	while(result>0){
+		char    ch;
+		result = read (si->command_pipe_fd,&ch,1);
+		if (result > 0) {
+			ch_buffer[pos++]=ch;
+		} else if (pos >= 256) {
+			dbg(0, "Invalid command! [%s]", ch_buffer);
+			pos = 0;
+			strcpy(ch_buffer, "");
+		} else if (pos>0)
+		{
+			dbg(0, "command is %s", ch_buffer);
+
+			/*execute command!*/
+			process_command(ch_buffer, pos, si);
+			pos = 0;
+			strcpy(ch_buffer, "");
+		}
+		if (result<=0){
+			return TRUE;
+		}
+	}
+	return TRUE;
+}
+
 static gboolean periodic_msg_handler(struct stream_info *si)
 {
-	dbg(4, "called\n");
+	dbg(4, "called");
 
 	if (si->connected == FALSE) {
-		dbg(2, "Destroying 'periodic message' handler\n");
+		dbg(2, "Destroying 'periodic message' handler");
 		return FALSE;
 	}
 
@@ -163,7 +315,7 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 
 		g_print("\n");
 	} else {
-		dbg(2, "Destroying 'periodic message' handler\n");
+		dbg(2, "Destroying 'periodic message' handler");
 		return FALSE;
 	}
 
@@ -177,7 +329,7 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 static void media_configure_handler(GstRTSPMediaFactory *factory,
 				    GstRTSPMedia *media, struct stream_info *si)
 {
-	dbg(4, "called\n");
+	dbg(4, "called");
 
 	si->media = media;
 
@@ -193,38 +345,51 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 	si->stream[protocol] = gst_bin_get_by_name(
 		GST_BIN(si->stream[pipeline]), "pay0");
 
-	if(!(si->stream[source] &&
-	     si->stream[caps] &&
-	     si->stream[encoder] &&
-	     si->stream[protocol])) {
-		g_printerr("Couldn't get pipeline elements\n");
-		exit(-ECODE_PIPE);
+	if((si->stream[source]))
+	{
+		/* Modify v4l2src Properties */
+		g_print("Setting input device=%s\n", si->video_in);
+		g_object_set(si->stream[source], "device", si->video_in, NULL);
+	} else
+	{
+		g_printerr("Couldn't get source (source0) pipeline element\n");
+	}
+	if((si->stream[encoder]))
+	{
+		/* Modify imxvpuenc_h264 Properties */
+		g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
+		g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate, NULL);
+		g_print("Setting encoder quant-param=%d\n", si->curr_quant_lvl);
+		g_object_set(si->stream[encoder], "quant-param", si->curr_quant_lvl,
+			     NULL);
+		g_object_set(si->stream[encoder], "idr-interval", si->idr, NULL);
+
+
+	} else {
+		g_printerr("Couldn't get encoder (enc0) pipeline element\n");
 	}
 
-	/* Modify v4l2src Properties */
-	g_print("Setting input device=%s\n", si->video_in);
-	g_object_set(si->stream[source], "device", si->video_in, NULL);
-
-	/* Modify imxvpuenc_h264 Properties */
-	g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
-	g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate, NULL);
-	g_print("Setting encoder quant-param=%d\n", si->curr_quant_lvl);
-	g_object_set(si->stream[encoder], "quant-param", si->curr_quant_lvl,
-		     NULL);
-	g_object_set(si->stream[encoder], "idr-interval", si->idr, NULL);
-
-	/* Modify rtph264pay Properties */
-	g_print("Setting rtp config-interval=%d\n",(int) si->config_interval);
-	g_object_set(si->stream[protocol], "config-interval",
-		     si->config_interval, NULL);
+	if((si->stream[protocol]))
+	{
+		/* Modify rtph264pay Properties */
+		g_print("Setting rtp config-interval=%d\n",(int) si->config_interval);
+		g_object_set(si->stream[protocol], "config-interval",
+			     si->config_interval, NULL);
+	} else
+	{
+		g_printerr("Couldn't get protocol (pay0) pipeline element\n");
+	}
 
 	if (si->num_cli == 1) {
 		/* Create Msg Event Handler */
-		dbg(2, "Creating 'periodic message' handler\n");
+		dbg(2, "Creating 'periodic message' handler");
 		g_timeout_add(si->msg_rate * 1000,
 			      (GSourceFunc)periodic_msg_handler, si);
 	}
 }
+
+
+
 
 /**
  * change_quant
@@ -232,24 +397,26 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
  */
 static void change_quant(struct stream_info *si)
 {
-	dbg(4, "called\n");
+	dbg(4, "called");
+	if (si->stream[encoder])
+	{
+		gint c = si->curr_quant_lvl;
+		int step = (si->max_quant_lvl - si->min_quant_lvl) / si->steps;
 
-	gint c = si->curr_quant_lvl;
-	int step = (si->max_quant_lvl - si->min_quant_lvl) / si->steps;
+		/* Change quantization based on # of clients * step factor */
+		/* It's OK to scale from min since lower val means higher qual */
+		si->curr_quant_lvl = ((si->num_cli - 1) * step) + si->min_quant_lvl;
 
-	/* Change quantization based on # of clients * step factor */
-	/* It's OK to scale from min since lower val means higher qual */
-	si->curr_quant_lvl = ((si->num_cli - 1) * step) + si->min_quant_lvl;
+		/* Cap to max quant level */
+		if (si->curr_quant_lvl > si->max_quant_lvl)
+			si->curr_quant_lvl = si->max_quant_lvl;
 
-	/* Cap to max quant level */
-	if (si->curr_quant_lvl > si->max_quant_lvl)
-		si->curr_quant_lvl = si->max_quant_lvl;
-
-	if (si->curr_quant_lvl != c) {
-		g_print("[%d]Changing quant-lvl from %d to %d\n", si->num_cli,
-			c, si->curr_quant_lvl);
-		g_object_set(si->stream[encoder], "quant-param",
-			     si->curr_quant_lvl, NULL);
+		if (si->curr_quant_lvl != c) {
+			g_print("[%d]Changing quant-lvl from %d to %d\n", si->num_cli,
+				c, si->curr_quant_lvl);
+			g_object_set(si->stream[encoder], "quant-param",
+					 si->curr_quant_lvl, NULL);
+		}
 	}
 }
 
@@ -259,25 +426,27 @@ static void change_quant(struct stream_info *si)
  */
 static void change_bitrate(struct stream_info *si)
 {
-	dbg(4, "called\n");
+	dbg(4, "called");
+	if (si->stream[encoder])
+	{
+		int c = si->curr_bitrate;
+		int step = (si->max_bitrate - si->min_bitrate) / si->steps;
 
-	int c = si->curr_bitrate;
-	int step = (si->max_bitrate - si->min_bitrate) / si->steps;
+		/* Change bitrate based on # of clients * step factor */
+		si->curr_bitrate = si->max_bitrate - ((si->num_cli - 1) * step);
 
-	/* Change bitrate based on # of clients * step factor */
-	si->curr_bitrate = si->max_bitrate - ((si->num_cli - 1) * step);
+		/* cap to min bitrate levels */
+		if (si->curr_bitrate < si->min_bitrate) {
+			dbg(3, "Snapping bitrate to %d", si->min_bitrate);
+			si->curr_bitrate = si->min_bitrate;
+		}
 
-	/* cap to min bitrate levels */
-	if (si->curr_bitrate < si->min_bitrate) {
-		dbg(3, "Snapping bitrate to %d\n", si->min_bitrate);
-		si->curr_bitrate = si->min_bitrate;
-	}
-
-	if (si->curr_bitrate != c) {
-		g_print("[%d]Changing bitrate from %d to %d\n", si->num_cli, c,
-			si->curr_bitrate);
-		g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate,
-			     NULL);
+		if (si->curr_bitrate != c) {
+			g_print("[%d]Changing bitrate from %d to %d\n", si->num_cli, c,
+				si->curr_bitrate);
+			g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate,
+					 NULL);
+		}
 	}
 }
 
@@ -288,28 +457,49 @@ static void change_bitrate(struct stream_info *si)
  */
 static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 {
-	dbg(4, "called\n");
+	dbg(4, "called");
 
 	si->num_cli--;
 
 	g_print("[%d]Client is closing down\n", si->num_cli);
 	if (si->num_cli == 0) {
-		dbg(3, "Connection terminated\n");
+		dbg(3, "Connection terminated");
 		si->connected = FALSE;
 
-		if (!(si->stream[pipeline] && si->stream[source] &&
-		      si->stream[caps] && si->stream[encoder] &&
-		      si->stream[protocol])) {
-			gst_element_set_state(si->stream[pipeline],
-					      GST_STATE_NULL);
-
-			gst_object_unref(si->stream[source]);
-			gst_object_unref(si->stream[caps]);
-			gst_object_unref(si->stream[encoder]);
-			gst_object_unref(si->stream[protocol]);
+		if ((si->stream[pipeline]))
+		{
+			dbg(4, "deleting pipeline");
+			gst_element_set_state(si->stream[pipeline],GST_STATE_NULL);
 			gst_object_unref(si->stream[pipeline]);
+			si->stream[pipeline] = NULL;
 		}
+		if ((si->stream[source]))
+		{
+			dbg(4, "deleting source");
+			gst_object_unref(si->stream[source]);
+			si->stream[source] = NULL;
+		}
+		if ((si->stream[caps]))
+		{
+			dbg(4, "deleting caps");
+			gst_object_unref(si->stream[caps]);
+			si->stream[caps] = NULL;
+		}
+		if ((si->stream[encoder]))
+		{
+			dbg(4, "deleting encoder");
+			gst_object_unref(si->stream[encoder]);
+			si->stream[encoder] = NULL;
+		}
+		if ((si->stream[protocol]))
+		{
+			dbg(4, "deleting protocol");
+			gst_object_unref(si->stream[protocol]);
+			si->stream[protocol] = NULL;
+		}
+
 		/* Created when first new client connected */
+		dbg(4, "freeing si->stream");
 		free(si->stream);
 	} else {
 		if (si->curr_bitrate)
@@ -317,6 +507,7 @@ static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 		else
 			change_quant(si);
 	}
+	dbg(4, "exiting");
 }
 
 /**
@@ -326,13 +517,14 @@ static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 			       struct stream_info *si)
 {
-	dbg(4, "called\n");
+	dbg(4, "called");
 
 	/* Used to initiate the media-configure callback */
 	static gboolean first_run = TRUE;
 
 	si->num_cli++;
 	g_print("[%d]A new client has connected\n", si->num_cli);
+	dbg(0, "*************Cliented connected! [%d]", si->num_cli);
 	si->connected = TRUE;
 
 	/* Create media-configure handler */
@@ -346,11 +538,13 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 		 * upon the first connection and is never destroyed after that.
 		 */
 		if (first_run == TRUE) {
-			dbg(2, "Creating 'media-configure' signal handler\n");
+			dbg(2, "Creating 'media-configure' signal handler");
 			g_signal_connect(si->factory, "media-configure",
 					 G_CALLBACK(media_configure_handler),
 					 si);
 		}
+
+
 	} else {
 		if (si->curr_bitrate)
 			change_bitrate(si);
@@ -359,38 +553,38 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 	}
 
 	/* Create new client_close_handler */
-	dbg(2, "Creating 'closed' signal handler\n");
+	dbg(2, "Creating 'closed' signal handler");
 	g_signal_connect(client, "closed",
 			 G_CALLBACK(client_close_handler), si);
-
+	dbg(4, "leaving");
 	first_run = FALSE;
 }
 
 int main (int argc, char *argv[])
 {
 	GstStateChangeReturn ret;
-
-	struct stream_info info = {
-		.num_cli = 0,
-		.connected = FALSE,
-		.video_in = "/dev/video0",
-		.config_interval = atoi(DEFAULT_CONFIG_INTERVAL),
-		.idr = atoi(DEFAULT_IDR_INTERVAL),
-		.steps = atoi(DEFAULT_STEPS) - 1,
-		.min_quant_lvl = atoi(MIN_QUANT_LVL),
-		.max_quant_lvl = atoi(MAX_QUANT_LVL),
-		.curr_quant_lvl = atoi(CURR_QUANT_LVL),
-		.min_bitrate = 1,
-		.max_bitrate = atoi(CURR_BR),
-		.curr_bitrate = atoi(CURR_BR),
-		.msg_rate = 5,
-	};
+	info.num_cli = 0;
+	info.connected = FALSE;
+	info.video_in = "/dev/video0";
+	info.config_interval = atoi(DEFAULT_CONFIG_INTERVAL);
+	info.idr = atoi(DEFAULT_IDR_INTERVAL);
+	info.steps = atoi(DEFAULT_STEPS) - 1;
+	info.min_quant_lvl = atoi(MIN_QUANT_LVL);
+	info.max_quant_lvl = atoi(MAX_QUANT_LVL);
+	info.curr_quant_lvl = atoi(CURR_QUANT_LVL);
+	info.min_bitrate = 1;
+	info.max_bitrate = atoi(CURR_BR);
+	info.curr_bitrate = atoi(CURR_BR);
+	info.msg_rate = 5;
+	info.command_pipe = NULL;
+	info.status_pipe = NULL;
+	info.userpipeline = NULL;
 
 	char *port = (char *) DEFAULT_PORT;
 	char *mount_point = (char *) DEFAULT_MOUNT_POINT;
 	char *src_element = (char *) DEFAULT_SRC_ELEMENT;
 	char *caps_filter = NULL;
-	char *user_pipeline = NULL;
+
 	/* Launch pipeline shouldn't exceed LAUNCH_MAX bytes of characters */
 	char launch[LAUNCH_MAX];
 
@@ -413,6 +607,8 @@ int main (int argc, char *argv[])
 		{"config-interval",  required_argument, 0, 'c'},
 		{"idr",              required_argument, 0, 'a'},
 		{"msg-rate",         required_argument, 0, 'r'},
+		{"command-pipe",     required_argument, 0,  0 },
+		{"status-pipe",      required_argument, 0,  0 },
 		{ /* Sentinel */ }
 	};
 	char *arg_parse = "?hvd:m:p:u:s:i:f:b:l:c:a:r:";
@@ -451,6 +647,8 @@ int main (int argc, char *argv[])
 		" (default: " DEFAULT_IDR_INTERVAL ")\n"
 		" --msg-rate,        -r - Rate of messages displayed"
 		" (default: 5s)\n\n"
+		" --command-pipe,       - Pipe for pad property commands for IPC"
+		" --status-pipe,        - Pipe for command status replies for IPC"
 		"Examples:\n"
 		" 1. Capture using imxv4l2videosrc, changes quality:\n"
 		"\tgst-variable-rtsp-server -s imxv4l2videosrc\n"
@@ -458,6 +656,10 @@ int main (int argc, char *argv[])
 		" 2. Create RTSP server out of user created pipeline:\n"
 		"\tgst-variable-rtsp-server -u \"videotestsrc ! imxvpuenc_h264"
 		" ! rtph264pay name=pay0 pt=96\"\n"
+		" 3. Create Same RTSP server out of user created pipeline, but with IPC:\n"
+				"\tgst-variable-rtsp-server -u \"videotestsrc ! imxvpuenc_h264"
+				" ! rtph264pay name=pay0 pt=96\" --command-pipe \"/tmp/rtsp-control\"\n"
+				" --status-pipe \"/tmp/rtsp-status\"\n"
 		;
 
 	/* Init GStreamer */
@@ -476,7 +678,7 @@ int main (int argc, char *argv[])
 			if (strcmp(long_opts[opt_ndx].name, "steps") == 0) {
 				/* Change steps to internal usage of it */
 				info.steps = atoi(optarg) - 1;
-				dbg(1, "set steps to: %d\n", info.steps);
+				dbg(1, "set steps to: %d", info.steps);
 			} else if (strcmp(long_opts[opt_ndx].name,
 					"min-bitrate") == 0) {
 				info.min_bitrate = atoi(optarg);
@@ -489,7 +691,7 @@ int main (int argc, char *argv[])
 					info.min_bitrate = 1;
 				}
 
-				dbg(1, "set min bitrate to: %d\n",
+				dbg(1, "set min bitrate to: %d",
 				    info.min_bitrate);
 			} else if (strcmp(long_opts[opt_ndx].name,
 					  "max-quant-lvl") == 0) {
@@ -508,8 +710,18 @@ int main (int argc, char *argv[])
 					info.max_quant_lvl =
 						atoi(MIN_QUANT_LVL);
 				}
-				dbg(1, "set max quant to: %d\n",
+				dbg(1, "set max quant to: %d",
 				    info.max_quant_lvl);
+			} else if (strcmp(long_opts[opt_ndx].name,
+						  "command-pipe") == 0) {
+					info.command_pipe = optarg;
+					dbg(1, "set command pipe to: %s",
+						info.command_pipe);
+			} else if (strcmp(long_opts[opt_ndx].name,
+						  "status-pipe") == 0) {
+					info.status_pipe = optarg;
+					dbg(1, "set status pipe to: %s",
+						info.status_pipe);
 			} else {
 				puts(usage);
 				return -ECODE_ARGS;
@@ -524,31 +736,31 @@ int main (int argc, char *argv[])
 			return ECODE_OKAY;
 		case 'd':
 			g_dbg = atoi(optarg);
-			dbg(1, "set debug level to: %d\n", g_dbg);
+			dbg(1, "set debug level to: %d", g_dbg);
 			break;
 		case 'm': /* Mount Point */
 			mount_point = optarg;
-			dbg(1, "set mount point to: %s\n", mount_point);
+			dbg(1, "set mount point to: %s", mount_point);
 			break;
 		case 'p': /* Port */
 			port = optarg;
-			dbg(1, "set port to: %s\n", port);
+			dbg(1, "set port to: %s", port);
 			break;
 		case 'u': /* User Pipeline*/
-			user_pipeline = optarg;
-			dbg(1, "set user pipeline to: %s\n", user_pipeline);
+			info.userpipeline = optarg;
+			dbg(1, "set user pipeline to: %s", info.userpipeline);
 			break;
 		case 's': /* Video source element */
 			src_element = optarg;
-			dbg(1, "set source element to: %s\n", src_element);
+			dbg(1, "set source element to: %s", src_element);
 			break;
 		case 'i': /* Video in parameter */
 			info.video_in = optarg;
-			dbg(1, "set video in to: %s\n", info.video_in);
+			dbg(1, "set video in to: %s", info.video_in);
 			break;
 		case 'f': /* caps filter */
 			caps_filter = optarg;
-			dbg(1, "set caps filter to: %s\n", caps_filter);
+			dbg(1, "set caps filter to: %s", caps_filter);
 			break;
 		case 'b': /* Max Bitrate */
 			info.max_bitrate = atoi(optarg);
@@ -561,7 +773,7 @@ int main (int argc, char *argv[])
 			}
 
 			info.curr_bitrate = info.max_bitrate;
-			dbg(1, "set max bitrate to: %d\n", info.max_bitrate);
+			dbg(1, "set max bitrate to: %d", info.max_bitrate);
 			break;
 		case 'l':
 			info.min_quant_lvl = atoi(optarg);
@@ -576,21 +788,21 @@ int main (int argc, char *argv[])
 			}
 
 			info.curr_quant_lvl = info.min_quant_lvl;
-			dbg(1, "set min quant lvl to: %d\n",
+			dbg(1, "set min quant lvl to: %d",
 			    info.min_quant_lvl);
 			break;
 		case 'c': /* config-interval */
 			info.config_interval = atoi(optarg);
-			dbg(1, "set rtsp config interval to: %d\n",
+			dbg(1, "set rtsp config interval to: %d",
 			    info.config_interval);
 			break;
 		case 'a': /* idr frame interval */
 			info.idr = atoi(optarg);
-			dbg(1, "set idr interval to: %d\n", info.idr);
+			dbg(1, "set idr interval to: %d", info.idr);
 			break;
 		case 'r': /* how often to display messages at */
 			info.msg_rate = atoi(optarg);
-			dbg(1, "set msg rate to: %d\n", info.msg_rate);
+			dbg(1, "set msg rate to: %d", info.msg_rate);
 			break;
 		default: /* Default - bad arg */
 			puts(usage);
@@ -637,8 +849,8 @@ int main (int argc, char *argv[])
 	gst_rtsp_media_factory_set_shared(info.factory, TRUE);
 
 	/* Source Pipeline */
-	if (user_pipeline)
-		snprintf(launch, LAUNCH_MAX, "( %s )", user_pipeline);
+	if (info.userpipeline)
+		snprintf(launch, LAUNCH_MAX, "( %s )", info.userpipeline);
 	else
 		snprintf(launch, LAUNCH_MAX, "%s name=source0 ! %s%s"
 			 STATIC_SINK_PIPELINE,
@@ -652,8 +864,11 @@ int main (int argc, char *argv[])
 	gst_rtsp_mount_points_add_factory(info.mounts, mount_point,
 					  info.factory);
 
+
 	/* Create GLIB MainContext */
 	info.main_loop = g_main_loop_new(NULL, FALSE);
+
+
 
 	/* Attach server to default maincontext */
 	ret = gst_rtsp_server_attach(info.server, NULL);
@@ -662,13 +877,26 @@ int main (int argc, char *argv[])
 		return -ECODE_RTSP;
 	}
 
-	/* Configure Callbacks */
-	/* Create new client handler (Called on new client connect) */
-	if (!user_pipeline) {
-		dbg(2, "Creating 'client-connected' signal handler\n");
-		g_signal_connect(info.server, "client-connected",
-				 G_CALLBACK(new_client_handler), &info);
+	/* Configure Callbacks and signals */
+
+	/* setup command pipe if specfied*/
+	if (info.command_pipe!=NULL)
+	{
+		mkfifo(info.command_pipe, 0666);
+		info.command_pipe_fd = open(info.command_pipe, O_RDONLY | O_NONBLOCK );
+		if (info.status_pipe!=NULL)
+		{
+			mkfifo(info.status_pipe, 0666);
+			info.status_pipe_fd = open(info.status_pipe, O_WRONLY);
+		}
+		g_timeout_add(100, (GSourceFunc)reader, &info);
 	}
+
+	/* Create new client handler (Called on new client connect) */
+
+	dbg(2, "Creating 'client-connected' signal handler");
+	g_signal_connect(info.server, "client-connected",
+			 G_CALLBACK(new_client_handler), &info);
 
 	/* Run GBLIB main loop until it returns */
 	g_print("Stream ready at rtsp://" DEFAULT_HOST ":%s%s\n",
@@ -680,6 +908,7 @@ int main (int argc, char *argv[])
 	g_object_unref(info.factory);
 	g_object_unref(info.media);
 	g_object_unref(info.mounts);
+
 	return ECODE_OKAY;
 }
 
