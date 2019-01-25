@@ -1,6 +1,6 @@
 #!/bin/bash
-[ "$SDK_LOC" ] || SDK_LOC=/opt/poky/1.8
-[ "$SDK_NAME" ] || SDK_NAME=cortexa9hf-vfp-neon-poky-linux-gnueabi
+[ "$SDK_LOC" ] || SDK_LOC=/opt/poky/2.3.3
+[ "$SDK_NAME" ] || SDK_NAME=cortexa9hf-neon-poky-linux-gnueabi
 
 [ ! -e ${SDK_LOC}/environment-setup-${SDK_NAME} ] && {
     echo "Sorry, please verify: ${SDK_LOC}/environment-setup-${SDK_NAME}"

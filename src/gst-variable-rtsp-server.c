@@ -65,6 +65,7 @@
 #define DEFAULT_MOUNT_POINT     "/stream"
 #define DEFAULT_HOST            "127.0.0.1"
 #define DEFAULT_SRC_ELEMENT     "v4l2src"
+#define DEFAULT_ENABLE_VARIABLE_MODE  "1"
 #define STATIC_SINK_PIPELINE			\
 	" imxipuvideotransform name=caps0 !"	\
 	" imxvpuenc_h264 name=enc0 !"		\
@@ -96,7 +97,7 @@
  * Source and Sink must always be positioned as such. Elements can be added
  * in between, however.
  */
-enum {pipeline=0, source, caps, encoder, protocol, sink};
+enum {pipeline=0, source, encoder, protocol, sink};
 #define NUM_ELEM (source + sink)
 
 
@@ -112,6 +113,7 @@ struct stream_info {
 	GstElement **stream;	      /* Array of elements */
 	char * userpipeline;
 	gboolean connected;	      /* Flag to see if this is in use */
+	gboolean enable_variable_mode; /* enable automatic rate adjustment */
 	gchar *video_in;	      /* Video in device */
 	gint config_interval;	      /* RTP Send Config Interval */
 	gint idr;		      /* Interval betweeen IDR frames */
@@ -127,10 +129,10 @@ struct stream_info {
 	gchar* status_pipe;   /* status-pipe */
 	gint command_pipe_fd; /* command-pipe file descriptor */
 	gint status_pipe_fd;  /* status-pipe file descriptor */
+	FILE * status_pipe_stream;  /* status-pipe file descriptor */
 };
 
 /* Global Variables */
-static struct stream_info info = {0};
 
 static unsigned int g_dbg = 0;
 
@@ -148,25 +150,385 @@ void _dbg(const char *func, unsigned int line,
 	}
 }
 
+
+static void setup_status_pipe_if_needed(struct stream_info *si)
+{
+	if (si->status_pipe != NULL && si->status_pipe_fd ==0)
+	{
+		dbg(4, "opening status pipe ");
+		si->status_pipe_fd = open(si->status_pipe, O_WRONLY );;
+		if (si->status_pipe_fd <= 0)
+		{
+			dbg(4, "Failed to open status pipe file descriptor ");
+		} else {
+			printf("status pipe fd = %d\n", si->status_pipe_fd);
+		}
+		dbg(4, "Creating status pipe stream ");
+		si->status_pipe_stream = fdopen(si->status_pipe_fd, "w");
+		if (si->status_pipe_stream == 0)
+		{
+			dbg(4, "Failed to open status pipe stream ");
+		}
+		dbg(4, "status pipe ready ");
+	}
+}
+
+static void send_status_pipe_msg(struct stream_info *si,
+		  const char* msg_type, const char *fmt, ...)
+{
+	setup_status_pipe_if_needed(si);
+	va_list ap;
+	va_start(ap, fmt);
+	if (si->status_pipe_stream)
+	{
+		fprintf(si->status_pipe_stream, "msg{\ntype:%s,\ndata:{\n", msg_type);
+		vfprintf(si->status_pipe_stream, fmt, ap);
+		fprintf(si->status_pipe_stream, "\n}}\n");
+		fflush(si->status_pipe_stream);
+	} else {
+		printf("status-reply: {");
+		vprintf(fmt, ap);
+		printf("}");
+		fflush(stdout);
+	}
+
+	va_end(ap);
+
+}
+
+static void do_command_setparam(struct stream_info *si,
+	char action[256],
+	char elementName[256],
+	char padName[256],
+	char paramName[256],
+	char paramValue[256]
+	)
+{
+
+	dbg(0, "action: [%s], element: [%s], padName: [%s], paramName: [%s], paramValue: [%s]",
+				action, elementName, padName, paramName, paramValue);
+	double value;
+	GstElement* gstElement = NULL;
+	if (si->connected==FALSE)
+	{
+		dbg(0, "not connected, nothing to do.");
+		send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		return;
+	} else {
+		dbg(0, "Connected! Lets do this!");
+	}
+
+	dbg(0, "getting pipeline");
+	/* Check gstreamer pipeline */
+
+	if (si->stream[pipeline] == NULL)
+	{
+		send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		dbg(0, "ERROR: pipeline element not populated, is there a stream running?");
+		return;
+	}
+
+	/* Get gstreamer element to modify*/
+	dbg(0, "get element: [%s]", elementName);
+	gstElement = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]), elementName);
+
+	if (gstElement == NULL)
+	{
+		send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		dbg(0, "ERROR: Failed getting the element name = %s", elementName);
+	}
+	/* Get pad to set value one*/
+	dbg(0, "get pad");
+	GstPad *gstPad = NULL;
+
+	if (strcmp(padName, "")==0)
+	{
+		dbg(1, "No Pad provided, setting element property.");
+
+	} else {
+		gstPad	= gst_element_get_static_pad(gstElement, padName);
+		if(gstPad == NULL)
+		{
+			gst_object_unref(gstElement);
+			send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+			dbg(0, "Failed to get static pad %s", padName);
+			return;
+		}
+	}
+	/* Set pad parameter */
+	GValue param = G_VALUE_INIT;
+	g_value_init(&param, G_TYPE_DOUBLE);
+	dbg(0, "parsing value");
+	value = atof(paramValue);
+	g_value_set_double(&param, value);
+	dbg(0, "setting property");
+	if (gstPad!=NULL){
+		g_object_set_property((GObject*)gstPad, paramName, &param);
+
+		/* Finished so unreference the pad*/
+		gst_object_unref(gstPad);
+	} else
+	{
+		g_object_set_property((GObject*)gstElement, paramName, &param);
+	}
+	send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+	/* Finished so unreference the element*/
+	gst_object_unref(gstElement);
+
+}
+
+
+/* obj will be NULL if we're printing properties of pad template pads */
+static void print_object_properties_info (struct stream_info *si, GstElement *element)
+{
+	GObject * obj;
+	GObjectClass * obj_class;
+	GParamSpec **property_specs;
+	guint num_properties, i;
+	gboolean readable;
+	obj = G_OBJECT(element);
+	obj_class = G_OBJECT_GET_CLASS(element);
+	property_specs = g_object_class_list_properties (obj_class, &num_properties);
+	char buffer[500];
+	char responsebuffer[8192]="";
+
+	sprintf(responsebuffer, "classname: %s,\n",G_OBJECT_CLASS_NAME (obj_class));
+	for (i = 0; i < num_properties; i++)
+	{
+		GValue value = { 0, };
+		GParamSpec *param = property_specs[i];
+		GType owner_type = param->owner_type;
+
+		/* We're printing pad properties */
+		if (obj == NULL && (owner_type == G_TYPE_OBJECT
+				|| owner_type == GST_TYPE_OBJECT || owner_type == GST_TYPE_PAD))
+		  continue;
+
+		g_value_init (&value, param->value_type);
+
+		sprintf(buffer,"%s:", g_param_spec_get_name (param));
+		gboolean print_value=TRUE;
+		readable = ! !(param->flags & G_PARAM_READABLE);
+		if (readable && obj != NULL) {
+		  g_object_get_property (obj, param->name, &value);
+		} else {
+		  /* if we can't read the property value, assume it's set to the default
+		   * (which might not be entirely true for sub-classes, but that's an
+		   * unlikely corner-case anyway) */
+		  g_value_reset (&value);
+		  continue;
+		}
+		switch (G_VALUE_TYPE (&value)) {
+		  case G_TYPE_STRING:
+		  {
+			const char *string_val = g_value_get_string (&value);
+			if (string_val == NULL)
+				sprintf(buffer + strlen(buffer), "null");
+			else
+				sprintf(buffer + strlen(buffer),"\"%s\"", string_val);
+			break;
+		  }
+		  case G_TYPE_BOOLEAN:
+		  {
+			gboolean bool_val = g_value_get_boolean (&value);
+
+			sprintf(buffer + strlen(buffer), "%s", bool_val ? "true" : "false");
+			break;
+		  }
+		  case G_TYPE_ULONG:
+		  {
+			gulong ulong_val = g_value_get_ulong (&value);
+
+			sprintf(buffer + strlen(buffer), "%lu",ulong_val);
+
+			break;
+		  }
+		  case G_TYPE_LONG:
+		  {
+			glong long_value = g_value_get_long (&value);
+			sprintf(buffer + strlen(buffer), "%ld",long_value);
+
+			break;
+		  }
+		  case G_TYPE_UINT:
+		  {
+			uint uint_value = g_value_get_uint (&value);
+			sprintf(buffer + strlen(buffer), "%u",uint_value);
+			break;
+		  }
+		  case G_TYPE_INT:
+		  {
+			  sprintf(buffer + strlen(buffer), "%d", g_value_get_int (&value));
+
+			break;
+		  }
+		  case G_TYPE_UINT64:
+		  {
+			  sprintf(buffer + strlen(buffer), "%" G_GUINT64_FORMAT, g_value_get_uint64 (&value));
+
+			break;
+		  }
+		  case G_TYPE_INT64:
+		  {
+			  sprintf(buffer + strlen(buffer), "%" G_GINT64_FORMAT, g_value_get_int64 (&value));
+
+			break;
+		  }
+		  case G_TYPE_FLOAT:
+		  {
+			  sprintf(buffer + strlen(buffer), "%15.7g", g_value_get_float (&value));
+
+			break;
+		  }
+		  case G_TYPE_DOUBLE:
+		  {
+			  sprintf(buffer + strlen(buffer), "%15.7g", g_value_get_double (&value));
+
+			break;
+		  }
+		  case G_TYPE_CHAR:
+		  case G_TYPE_UCHAR:
+		  {
+			//do nothing
+			  print_value=FALSE;
+			  break;
+		  }
+		  default:
+			if (G_IS_PARAM_SPEC_ENUM (param))
+			{
+
+				GEnumValue *values;
+				guint j = 0;
+				gint enum_value;
+				const gchar *value_nick = "";
+				values = G_ENUM_CLASS (g_type_class_ref (param->value_type))->values;
+				enum_value = g_value_get_enum (&value);
+
+				while (values[j].value_name)
+				{
+				  if (values[j].value == enum_value)
+				  value_nick = values[j].value_nick;
+				  j++;
+				}
+				sprintf(buffer + strlen(buffer), "[%d]%s", enum_value, value_nick);
+
+			  /* g_type_class_unref (ec); */
+			} else if (GST_IS_PARAM_SPEC_FRACTION (param))
+			{
+				sprintf(buffer + strlen(buffer), "%d/%d",gst_value_get_fraction_numerator (&value),
+					  gst_value_get_fraction_denominator (&value));
+			} else
+			{
+			  //do nothing
+				print_value=FALSE;
+			}
+			break;
+		}
+		if (print_value==TRUE)
+		{
+			sprintf(responsebuffer+strlen(responsebuffer),"%s,\n", buffer);
+		}
+		g_value_reset (&value);
+	}
+	if (num_properties == 0)
+	{
+		dbg (4, "No properties\n");
+	}
+	if (responsebuffer[strlen(responsebuffer)-2]==',')
+	{
+		responsebuffer[strlen(responsebuffer)-2]=0;
+	}
+	send_status_pipe_msg(si,"pipelineobjectprops", responsebuffer);
+
+	g_free (property_specs);
+}
+
+#define do_command_status(si) _do_command_status(__func__, __LINE__, si)
+static void _do_command_status(const char* functionname, int line, struct stream_info *si)
+{
+
+
+
+	char buffer[4096] = "";
+	sprintf(buffer, "source:\"%s:%d\",\n", functionname, line);
+	sprintf(buffer + strlen(buffer), "num_cli:%d,\n", si->num_cli);
+	sprintf(buffer + strlen(buffer), "connected:%s,\n", si->connected == TRUE ? "true" : "false");
+
+	sprintf(buffer + strlen(buffer), "config_interval:%d,\n", si->config_interval);
+	sprintf(buffer + strlen(buffer), "idr:%d,\n", si->idr);
+	if (si->enable_variable_mode == TRUE)
+	{
+		sprintf(buffer + strlen(buffer), "enable_variable_mode:true,\n");
+
+		sprintf(buffer + strlen(buffer), "steps:%d,\n", si->steps);
+		sprintf(buffer + strlen(buffer), "curr_quant_lvl:%d,\n", si->curr_quant_lvl);
+		sprintf(buffer + strlen(buffer), "min_quant_lvl:%d,\n", si->min_quant_lvl);
+		sprintf(buffer + strlen(buffer), "max_quant_lvl:%d,\n", si->max_quant_lvl);
+		sprintf(buffer + strlen(buffer), "curr_bitrate:%d,\n", si->curr_bitrate);
+		sprintf(buffer + strlen(buffer), "min_bitrate:%d,\n", si->min_bitrate);
+		sprintf(buffer + strlen(buffer), "max_bitrate:%d,\n", si->max_bitrate);
+
+	} else {
+		sprintf(buffer + strlen(buffer), "enable_variable_mode:false,\n");
+	}
+
+	sprintf(buffer + strlen(buffer), "periodic_msg_rate:%d", si->msg_rate);
+
+	send_status_pipe_msg(si,"status", buffer);
+
+}
+static void do_command_print_bin(struct stream_info *si) {
+	if (si->connected==FALSE)
+	{
+		dbg(0, "not connected, nothing to do.");
+		return;
+	} else {
+		dbg(0, "Connected! Lets do this!");
+	}
+
+	if (GST_IS_BIN (si->stream[pipeline])) {
+		GstIterator *it = gst_bin_iterate_elements (GST_BIN (si->stream[pipeline]));
+		GValue item = G_VALUE_INIT;
+		gboolean done = FALSE;
+
+		while (!done) {
+				switch (gst_iterator_next (it, &item)) {
+					case GST_ITERATOR_OK:
+					{
+						GstElement *element = g_value_get_object(&item);
+						print_object_properties_info(si, element);
+						printf("\n");
+						g_value_reset (&item);
+						break;
+					}
+					case GST_ITERATOR_RESYNC:
+					{
+						gst_iterator_resync (it);
+						break;
+					}
+					case GST_ITERATOR_ERROR:
+					{
+						done = TRUE;
+						break;
+					}
+					case GST_ITERATOR_DONE:
+					{
+						done = TRUE;
+						break;
+					}
+			}
+		}
+		gst_iterator_free (it);
+	}
+}
 static void process_command(char command[256], int len, struct stream_info *si)
 {
 	//mutex_lock();
 	dbg(0, " Command: %s", command);
-	char action[256]="";
-	char elementName[256]="";
-	char padName[256]="";
-	char paramName[256]="";
-	char paramValue[256]="";
-	const char *ptr[5];
+
+	char params[5][256] = {"","","","",""};
 	char catme[2];
 	catme[1]=0;
-	ptr[0] = (const char *)&action;
-	ptr[1] = (const char *)&elementName;
-	ptr[2] = (const char *)&padName;
-	ptr[3] = (const char *)&paramName;
-	ptr[4] = (const char *)&paramValue;
-	double value;
-	GstElement* gstElement = NULL;
 
 	int delimeter=0;
 	for (int i =0; i < len; i++)
@@ -176,84 +538,33 @@ static void process_command(char command[256], int len, struct stream_info *si)
 			delimeter++;
 		else if (delimeter <= 4)
 		{
-			strcat((char*)ptr[delimeter], catme);
+			strcat(params[delimeter], catme);
 		} else {
 			dbg(0, "extra character: %s", catme);
 		}
 	}
 
-	dbg(0, "action: [%s], element: [%s], padName: [%s], paramName: [%s], paramValue: [%s]",
-			action, elementName, padName, paramName, paramValue);
-
-	if (delimeter < 4)
+	if (strcmp(params[0], "setparam")==0)
 	{
-	dbg(0, "not enough values: %s", delimeter);
-	}
-    if (strcmp(action, "setparam")==0)
-    {
-    	if (si->connected==FALSE)
-    	{
-    		dbg(0, "not connected, nothing to do.");
-    		return;
-    	} else {
-    		dbg(0, "Connected! Lets do this!");
-    	}
-
-    	dbg(0, "getting pipeline");
-		/* Check gstreamer pipeline */
-
-		if (si->stream[pipeline] == NULL)
+		dbg(4, "calling do_command_setparam");
+		if (delimeter < 4)
 		{
-			dbg(0, "ERROR: pipeline element not populated, is there a stream running?");
-			return;
-		}
-
-		/* Get gstreamer element to modify*/
-		dbg(0, "get element: [%s]", elementName);
-		gstElement = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]), elementName);
-
-		if (gstElement == NULL)
-		{
-			dbg(0, "ERROR: Failed getting the element name = %s", elementName);
-		}
-		/* Get pad to set value one*/
-		dbg(0, "get pad");
-		GstPad *gstPad = NULL;
-
-		if (strcmp(padName, "")==0)
-		{
-			dbg(1, "No Pad provided, setting element property.");
-
+		dbg(0, "not enough values: %d", delimeter);
 		} else {
-			gstPad	= gst_element_get_static_pad(gstElement, padName);
-			if(gstPad == NULL)
-			{
-				gst_object_unref(gstElement);
-				dbg(0, "Failed to get static pad %s", padName);
-				return;
-			}
+			do_command_setparam(si,params[0], params[1], params[2], params[3], params[4] );
 		}
-		/* Set pad parameter */
-		GValue param = G_VALUE_INIT;
-		g_value_init(&param, G_TYPE_DOUBLE);
-		dbg(0, "parsing value");
-		value = atof(paramValue);
-		g_value_set_double(&param, value);
-		dbg(0, "setting property");
-		if (gstPad!=NULL){
-			g_object_set_property((GObject*)gstPad, paramName, &param);
+	} else if (strcmp(params[0], "printbin")==0)
+	{
+		dbg(4, "calling do_command_print_bin");
+		do_command_print_bin(si);
+	} else if (strcmp(params[0], "status")==0)
+	{
+		dbg(4, "calling do_command_status");
+		do_command_status(si);
+	} else {
+		dbg(0, "Undefined action [%s]", params[0]);
+	}
 
-			/* Finished so unreference the pad*/
-			gst_object_unref(gstPad);
-		} else
-		{
-			g_object_set_property((GObject*)gstElement, paramName, &param);
-		}
-		/* Finished so unreference the element*/
-		gst_object_unref(gstElement);
-    } else {
-    	dbg(0, "Undefined action %s", action);
-    }
 }
 
 static gboolean reader(struct stream_info *si)
@@ -263,8 +574,8 @@ static gboolean reader(struct stream_info *si)
 	int result= 1;
 	while(result>0){
 		char    ch;
-		result = read (si->command_pipe_fd,&ch,1);
-		if (result > 0) {
+		result = read (si->command_pipe_fd, &ch, 1);
+		if (result > 0 && ch != '\n') {
 			ch_buffer[pos++]=ch;
 		} else if (pos >= 256) {
 			dbg(0, "Invalid command! [%s]", ch_buffer);
@@ -299,12 +610,14 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 		GstStructure *stats;
 		g_print("### MSG BLOCK ###\n");
 		g_print("Number of Clients    : %d\n", si->num_cli);
-		g_print("Current Quant Level  : %d\n", si->curr_quant_lvl);
-		g_print("Current Bitrate Level: %d\n", si->curr_bitrate);
-		g_print("Step Factor          : %d\n", (si->curr_bitrate) ?
-			((si->max_bitrate - si->min_bitrate) / si->steps) :
-			((si->max_quant_lvl - si->min_quant_lvl) / si->steps));
-
+		if (si->enable_variable_mode)
+		{
+			g_print("Current Quant Level  : %d\n", si->curr_quant_lvl);
+			g_print("Current Bitrate Level: %d\n", si->curr_bitrate);
+			g_print("Step Factor          : %d\n", (si->curr_bitrate) ?
+				((si->max_bitrate - si->min_bitrate) / si->steps) :
+				((si->max_quant_lvl - si->min_quant_lvl) / si->steps));
+		}
 		g_object_get(G_OBJECT(si->stream[protocol]), "stats", &stats,
 			     NULL);
 		if (stats) {
@@ -338,8 +651,6 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 	si->stream[pipeline] = gst_rtsp_media_get_element(media);
 	si->stream[source] = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]),
 						 "source0");
-	si->stream[caps] = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]),
-					       "caps0");
 	si->stream[encoder] = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]),
 						  "enc0");
 	si->stream[protocol] = gst_bin_get_by_name(
@@ -357,13 +668,19 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 	if((si->stream[encoder]))
 	{
 		/* Modify imxvpuenc_h264 Properties */
-		g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
-		g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate, NULL);
-		g_print("Setting encoder quant-param=%d\n", si->curr_quant_lvl);
-		g_object_set(si->stream[encoder], "quant-param", si->curr_quant_lvl,
-			     NULL);
-		g_object_set(si->stream[encoder], "idr-interval", si->idr, NULL);
 
+		if (si->enable_variable_mode)
+		{
+			g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
+			g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate, NULL);
+			g_print("Setting encoder quant-param=%d\n", si->curr_quant_lvl);
+			g_object_set(si->stream[encoder], "quant-param", si->curr_quant_lvl,
+					 NULL);
+			g_object_set(si->stream[encoder], "idr-interval", si->idr, NULL);
+		} else
+		{
+			dbg(2,"Not setting any encoder properties");
+		}
 
 	} else {
 		g_printerr("Couldn't get encoder (enc0) pipeline element\n");
@@ -382,14 +699,17 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 
 	if (si->num_cli == 1) {
 		/* Create Msg Event Handler */
-		dbg(2, "Creating 'periodic message' handler");
-		g_timeout_add(si->msg_rate * 1000,
-			      (GSourceFunc)periodic_msg_handler, si);
+
+		if (si->msg_rate>0)
+		{
+			dbg(4, "Creating 'periodic message' handler");
+			g_timeout_add(si->msg_rate * 1000,
+					  (GSourceFunc)periodic_msg_handler, si);
+		} else {
+			dbg(4, "'periodic message' handler disabled");
+		}
 	}
 }
-
-
-
 
 /**
  * change_quant
@@ -479,12 +799,6 @@ static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 			gst_object_unref(si->stream[source]);
 			si->stream[source] = NULL;
 		}
-		if ((si->stream[caps]))
-		{
-			dbg(4, "deleting caps");
-			gst_object_unref(si->stream[caps]);
-			si->stream[caps] = NULL;
-		}
 		if ((si->stream[encoder]))
 		{
 			dbg(4, "deleting encoder");
@@ -501,11 +815,15 @@ static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 		/* Created when first new client connected */
 		dbg(4, "freeing si->stream");
 		free(si->stream);
+		do_command_status(si);
 	} else {
-		if (si->curr_bitrate)
-			change_bitrate(si);
-		else
-			change_quant(si);
+		if (si->enable_variable_mode)
+		{
+			if (si->curr_bitrate)
+				change_bitrate(si);
+			else
+				change_quant(si);
+		}
 	}
 	dbg(4, "exiting");
 }
@@ -546,16 +864,20 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 
 
 	} else {
-		if (si->curr_bitrate)
-			change_bitrate(si);
-		else
-			change_quant(si);
+		if (si->enable_variable_mode)
+		{
+			if (si->curr_bitrate)
+				change_bitrate(si);
+			else
+				change_quant(si);
+		}
 	}
 
 	/* Create new client_close_handler */
 	dbg(2, "Creating 'closed' signal handler");
 	g_signal_connect(client, "closed",
 			 G_CALLBACK(client_close_handler), si);
+	do_command_status(si);
 	dbg(4, "leaving");
 	first_run = FALSE;
 }
@@ -563,52 +885,58 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 int main (int argc, char *argv[])
 {
 	GstStateChangeReturn ret;
-	info.num_cli = 0;
-	info.connected = FALSE;
-	info.video_in = "/dev/video0";
-	info.config_interval = atoi(DEFAULT_CONFIG_INTERVAL);
-	info.idr = atoi(DEFAULT_IDR_INTERVAL);
-	info.steps = atoi(DEFAULT_STEPS) - 1;
-	info.min_quant_lvl = atoi(MIN_QUANT_LVL);
-	info.max_quant_lvl = atoi(MAX_QUANT_LVL);
-	info.curr_quant_lvl = atoi(CURR_QUANT_LVL);
-	info.min_bitrate = 1;
-	info.max_bitrate = atoi(CURR_BR);
-	info.curr_bitrate = atoi(CURR_BR);
-	info.msg_rate = 5;
-	info.command_pipe = NULL;
-	info.status_pipe = NULL;
-	info.userpipeline = NULL;
+	struct stream_info info = {
+		.num_cli = 0,
+		.connected = FALSE,
+		.video_in = "/dev/video0",
+		.config_interval = atoi(DEFAULT_CONFIG_INTERVAL),
+		.idr = atoi(DEFAULT_IDR_INTERVAL),
+		.enable_variable_mode = atoi(DEFAULT_ENABLE_VARIABLE_MODE),
+		.steps = atoi(DEFAULT_STEPS) - 1,
+		.min_quant_lvl = atoi(MIN_QUANT_LVL),
+		.max_quant_lvl = atoi(MAX_QUANT_LVL),
+		.curr_quant_lvl = atoi(CURR_QUANT_LVL),
+		.min_bitrate = 1,
+		.max_bitrate = atoi(CURR_BR),
+		.curr_bitrate = atoi(CURR_BR),
+		.msg_rate = 5,
+		.command_pipe = NULL,
+		.status_pipe = NULL,
+		.command_pipe_fd = 0,
+		.status_pipe_fd = 0,
+		.status_pipe_stream = NULL,
+		.userpipeline = NULL,
+
+	};
 
 	char *port = (char *) DEFAULT_PORT;
 	char *mount_point = (char *) DEFAULT_MOUNT_POINT;
 	char *src_element = (char *) DEFAULT_SRC_ELEMENT;
-	char *caps_filter = NULL;
 
 	/* Launch pipeline shouldn't exceed LAUNCH_MAX bytes of characters */
 	char launch[LAUNCH_MAX];
 
 	/* User Arguments */
 	const struct option long_opts[] = {
-		{"help",             no_argument,       0, '?'},
-		{"version",          no_argument,       0, 'v'},
-		{"debug",            required_argument, 0, 'd'},
-		{"mount-point",      required_argument, 0, 'm'},
-		{"port",             required_argument, 0, 'p'},
-		{"user-pipeline",    required_argument, 0, 'u'},
-		{"src-element",      required_argument, 0, 's'},
-		{"video-in",         required_argument, 0, 'i'},
-		{"caps-filter",      required_argument, 0, 'f'},
-		{"steps",            required_argument, 0,  0 },
-		{"min-bitrate",      required_argument, 0,  0 },
-		{"max-bitrate",      required_argument, 0, 'b'},
-		{"max-quant-lvl",    required_argument, 0,  0 },
-		{"min-quant-lvl",    required_argument, 0, 'l'},
-		{"config-interval",  required_argument, 0, 'c'},
-		{"idr",              required_argument, 0, 'a'},
-		{"msg-rate",         required_argument, 0, 'r'},
-		{"command-pipe",     required_argument, 0,  0 },
-		{"status-pipe",      required_argument, 0,  0 },
+		{"help",                 no_argument,       0, '?'},
+		{"version",              no_argument,       0, 'v'},
+		{"debug",                required_argument, 0, 'd'},
+		{"mount-point",          required_argument, 0, 'm'},
+		{"port",                 required_argument, 0, 'p'},
+		{"user-pipeline",        required_argument, 0, 'u'},
+		{"src-element",          required_argument, 0, 's'},
+		{"video-in",             required_argument, 0, 'i'},
+		{"enable-variable-mode", required_argument, 0, 'e' },
+		{"steps",                required_argument, 0,  0 },
+		{"min-bitrate",          required_argument, 0,  0 },
+		{"max-bitrate",          required_argument, 0, 'b'},
+		{"max-quant-lvl",        required_argument, 0,  0 },
+		{"min-quant-lvl",        required_argument, 0, 'l'},
+		{"config-interval",      required_argument, 0, 'c'},
+		{"idr",                  required_argument, 0, 'a'},
+		{"msg-rate",             required_argument, 0, 'r'},
+		{"command-pipe",         required_argument, 0,  0 },
+		{"status-pipe",          required_argument, 0,  0 },
 		{ /* Sentinel */ }
 	};
 	char *arg_parse = "?hvd:m:p:u:s:i:f:b:l:c:a:r:";
@@ -629,8 +957,8 @@ int main (int argc, char *argv[])
 		"                         a 'device' property"
 		" (default: " DEFAULT_SRC_ELEMENT ")\n"
 		" --video-in,        -i - Input Device (default: /dev/video0)\n"
-		" --caps-filter,     -f - Caps filter between src and\n"
-		"                         video transform (default: None)\n"
+		" --enable-variable-mode   -e - Enable variable bit rate logic, 0 = off, 1 = on \n"
+		" (default: " DEFAULT_ENABLE_VARIABLE_MODE " \n"
 		" --steps,              - Steps to get to 'worst' quality"
 		" (default: " DEFAULT_STEPS ")\n"
 		" --max-bitrate,     -b - Max bitrate cap, 0 == VBR"
@@ -646,7 +974,7 @@ int main (int argc, char *argv[])
 		" --idr              -a - Interval between IDR Frames"
 		" (default: " DEFAULT_IDR_INTERVAL ")\n"
 		" --msg-rate,        -r - Rate of messages displayed"
-		" (default: 5s)\n\n"
+		" (default: 5s, 0 disables)\n\n"
 		" --command-pipe,       - Pipe for pad property commands for IPC"
 		" --status-pipe,        - Pipe for command status replies for IPC"
 		"Examples:\n"
@@ -758,9 +1086,15 @@ int main (int argc, char *argv[])
 			info.video_in = optarg;
 			dbg(1, "set video in to: %s", info.video_in);
 			break;
-		case 'f': /* caps filter */
-			caps_filter = optarg;
-			dbg(1, "set caps filter to: %s", caps_filter);
+		case 'e': /* enable-variable-mode */
+			if (atoi(optarg) > 0)
+			{
+				info.enable_variable_mode = TRUE;
+			} else
+			{
+				info.enable_variable_mode = FALSE;
+			}
+			dbg(1, "set enable-variable-mode to: %d", info.enable_variable_mode);
 			break;
 		case 'b': /* Max Bitrate */
 			info.max_bitrate = atoi(optarg);
@@ -852,11 +1186,10 @@ int main (int argc, char *argv[])
 	if (info.userpipeline)
 		snprintf(launch, LAUNCH_MAX, "( %s )", info.userpipeline);
 	else
-		snprintf(launch, LAUNCH_MAX, "%s name=source0 ! %s%s"
+		snprintf(launch, LAUNCH_MAX, "%s name=source0 ! "
 			 STATIC_SINK_PIPELINE,
-			 src_element,
-			 (caps_filter) ? caps_filter : "",
-			 (caps_filter) ? " ! " : "");
+			 src_element
+			 );
 	g_print("Pipeline set to: %s...\n", launch);
 	gst_rtsp_media_factory_set_launch(info.factory, launch);
 
@@ -883,11 +1216,14 @@ int main (int argc, char *argv[])
 	if (info.command_pipe!=NULL)
 	{
 		mkfifo(info.command_pipe, 0666);
-		info.command_pipe_fd = open(info.command_pipe, O_RDONLY | O_NONBLOCK );
+		info.command_pipe_fd = open(info.command_pipe, O_RDONLY | O_NONBLOCK );;
+
+
 		if (info.status_pipe!=NULL)
 		{
+			dbg(4, "Creating status pipe [%s]", info.status_pipe);
 			mkfifo(info.status_pipe, 0666);
-			info.status_pipe_fd = open(info.status_pipe, O_WRONLY);
+
 		}
 		g_timeout_add(100, (GSourceFunc)reader, &info);
 	}
