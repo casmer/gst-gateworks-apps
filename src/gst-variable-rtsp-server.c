@@ -80,18 +80,22 @@
 /**
  * imxvpuenc_h264:
  *  - bitrate: Bitrate to use, in kbps
- *             (0 = no bitrate control; constant quality mode is used)
+ *             (0 = no bitrate control; variable quality mode is used)
  *  - quant-param: Constant quantization quality parameter
  *                 (ignored if bitrate is set to a nonzero value)
  *                 Please note that '0' is the 'best' quality.
  */
 #define MIN_BR  "0"	     /* The min value "bitrate" to (0 = VBR)*/
 #define MAX_BR  "4294967295" /* Max as defined by imxvpuenc_h264 */
-#define CURR_BR "10000"      /* Default to 10mbit/s */
+#define DEFAULT_BR "10000"      /* Default to 10mbit/s */
 
 #define MIN_QUANT_LVL  "0"   /* Minimum quant-param for h264 */
 #define MAX_QUANT_LVL  "51"  /* Maximum quant-param for h264 */
 #define CURR_QUANT_LVL MIN_QUANT_LVL
+
+#define MSG_T_SETPARAM "setparam"
+#define MSG_T_ELEMENTPROPS "elementprops"
+#define MSG_T_STATUS "status"
 
 /**
  * Source and Sink must always be positioned as such. Elements can be added
@@ -121,8 +125,9 @@ struct stream_info {
 	gint min_quant_lvl;	      /* Min Quant Level */
 	gint max_quant_lvl;	      /* Max Quant Level */
 	gint curr_quant_lvl;	      /* Current Quant Level */
-	gint min_bitrate;	      /* Min Bitrate */
-	gint max_bitrate;	      /* Max Bitrate */
+	gint min_bitrate;	      /* Min total Bitrate */
+	gint max_bitrate;	      /* Max total Bitrate */
+	gint cap_bitrate;	      /* Over Cap on Max Bitrate, for VBR with Cap mode */
 	gint curr_bitrate;	      /* Current Bitrate */
 	gint msg_rate;		      /* In Seconds */
 	gchar* command_pipe;   /* command-pipe */
@@ -212,7 +217,7 @@ static void do_command_setparam(struct stream_info *si,
 	if (si->connected==FALSE)
 	{
 		dbg(0, "not connected, nothing to do.");
-		send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 		return;
 	} else {
 		dbg(0, "Connected! Lets do this!");
@@ -223,7 +228,7 @@ static void do_command_setparam(struct stream_info *si,
 
 	if (si->stream[pipeline] == NULL)
 	{
-		send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 		dbg(0, "ERROR: pipeline element not populated, is there a stream running?");
 		return;
 	}
@@ -234,7 +239,7 @@ static void do_command_setparam(struct stream_info *si,
 
 	if (gstElement == NULL)
 	{
-		send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 		dbg(0, "ERROR: Failed getting the element name = %s", elementName);
 	}
 	/* Get pad to set value one*/
@@ -250,7 +255,7 @@ static void do_command_setparam(struct stream_info *si,
 		if(gstPad == NULL)
 		{
 			gst_object_unref(gstElement);
-			send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+			send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 			dbg(0, "Failed to get static pad %s", padName);
 			return;
 		}
@@ -271,7 +276,7 @@ static void do_command_setparam(struct stream_info *si,
 	{
 		g_object_set_property((GObject*)gstElement, paramName, &param);
 	}
-	send_status_pipe_msg(si, "setparam", "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+	send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 	/* Finished so unreference the element*/
 	gst_object_unref(gstElement);
 
@@ -438,7 +443,7 @@ static void print_object_properties_info (struct stream_info *si, GstElement *el
 	{
 		responsebuffer[strlen(responsebuffer)-2]=0;
 	}
-	send_status_pipe_msg(si,"pipelineobjectprops", responsebuffer);
+	send_status_pipe_msg(si,MSG_T_ELEMENTPROPS, responsebuffer);
 
 	g_free (property_specs);
 }
@@ -614,7 +619,7 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 		{
 			g_print("Current Quant Level  : %d\n", si->curr_quant_lvl);
 			g_print("Current Bitrate Level: %d\n", si->curr_bitrate);
-			g_print("Step Factor          : %d\n", (si->curr_bitrate) ?
+			g_print("Step Factor          : %d\n", (si->max_bitrate) ?
 				((si->max_bitrate - si->min_bitrate) / si->steps) :
 				((si->max_quant_lvl - si->min_quant_lvl) / si->steps));
 		}
@@ -718,7 +723,7 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 static void change_quant(struct stream_info *si)
 {
 	dbg(4, "called");
-	if (si->stream[encoder])
+	if (si->stream[encoder] && si->max_quant_lvl > 0)
 	{
 		gint c = si->curr_quant_lvl;
 		int step = (si->max_quant_lvl - si->min_quant_lvl) / si->steps;
@@ -819,7 +824,7 @@ static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 	} else {
 		if (si->enable_variable_mode)
 		{
-			if (si->curr_bitrate)
+			if (si->max_bitrate)
 				change_bitrate(si);
 			else
 				change_quant(si);
@@ -866,7 +871,7 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 	} else {
 		if (si->enable_variable_mode)
 		{
-			if (si->curr_bitrate)
+			if (si->max_bitrate)
 				change_bitrate(si);
 			else
 				change_quant(si);
@@ -894,11 +899,11 @@ int main (int argc, char *argv[])
 		.enable_variable_mode = atoi(DEFAULT_ENABLE_VARIABLE_MODE),
 		.steps = atoi(DEFAULT_STEPS) - 1,
 		.min_quant_lvl = atoi(MIN_QUANT_LVL),
-		.max_quant_lvl = atoi(MAX_QUANT_LVL),
+		.max_quant_lvl = atoi(MIN_QUANT_LVL), //Default to min, to disable the adjsutment
 		.curr_quant_lvl = atoi(CURR_QUANT_LVL),
 		.min_bitrate = 1,
-		.max_bitrate = atoi(CURR_BR),
-		.curr_bitrate = atoi(CURR_BR),
+		.max_bitrate = atoi(MIN_BR),
+		.curr_bitrate = atoi(DEFAULT_BR),
 		.msg_rate = 5,
 		.command_pipe = NULL,
 		.status_pipe = NULL,
@@ -962,7 +967,7 @@ int main (int argc, char *argv[])
 		" --steps,              - Steps to get to 'worst' quality"
 		" (default: " DEFAULT_STEPS ")\n"
 		" --max-bitrate,     -b - Max bitrate cap, 0 == VBR"
-		" (default: " CURR_BR ")\n"
+		" (default: " DEFAULT_BR ")\n"
 		" --min-bitrate,        - Min bitrate cap"
 		" (default: 1)\n"
 		" --max-quant-lvl,      - Max quant-level cap"
@@ -1007,6 +1012,20 @@ int main (int argc, char *argv[])
 				/* Change steps to internal usage of it */
 				info.steps = atoi(optarg) - 1;
 				dbg(1, "set steps to: %d", info.steps);
+			} else if (strcmp(long_opts[opt_ndx].name,
+					"cap-bitrate") == 0) {
+				info.cap_bitrate = atoi(optarg);
+				if (info.cap_bitrate > atoi(MAX_BR)) {
+					g_print("bitrate cap is "
+						MAX_BR ".\n");
+					info.cap_bitrate = atoi(MAX_BR);
+				} else if (info.cap_bitrate <= atoi(MIN_BR)) {
+					g_print("cap bitrate is " MAX_BR "\n");
+					info.cap_bitrate = atoi(MAX_BR);
+				}
+
+				dbg(1, "set cap bitrate to: %d",
+				    info.cap_bitrate);
 			} else if (strcmp(long_opts[opt_ndx].name,
 					"min-bitrate") == 0) {
 				info.min_bitrate = atoi(optarg);
@@ -1106,7 +1125,6 @@ int main (int argc, char *argv[])
 				info.max_bitrate = atoi(MIN_BR);
 			}
 
-			info.curr_bitrate = info.max_bitrate;
 			dbg(1, "set max bitrate to: %d", info.max_bitrate);
 			break;
 		case 'l':
@@ -1144,6 +1162,14 @@ int main (int argc, char *argv[])
 		}
 	}
 
+
+	if (info.max_bitrate > info.cap_bitrate)
+	{
+		g_printerr("Max bitrate must be <= cap bitrate, setting max bit rate to %d.\n",info.cap_bitrate );
+		info.max_bitrate = info.cap_bitrate;
+	}
+
+	info.curr_bitrate = info.cap_bitrate;
 	/* Validate inputs */
 	if (info.max_quant_lvl < info.min_quant_lvl) {
 		g_printerr("Max Quant level must be"
@@ -1151,7 +1177,7 @@ int main (int argc, char *argv[])
 		return -ECODE_ARGS;
 	}
 
-	if ((info.max_bitrate + 1) < info.min_bitrate) {
+	if (info.max_bitrate>0 && info.max_bitrate <= info.min_bitrate) {
 		g_printerr("Max bitrate must be greater than min bitrate\n");
 		return -ECODE_ARGS;
 	}
