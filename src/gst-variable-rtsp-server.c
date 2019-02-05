@@ -135,6 +135,7 @@ struct stream_info {
 	gint command_pipe_fd; /* command-pipe file descriptor */
 	gint status_pipe_fd;  /* status-pipe file descriptor */
 	FILE * status_pipe_stream;  /* status-pipe file descriptor */
+	GstRTSPAddressPool* rtspAddressPool; /* Address pool used to restrict the RTSP stream to a known port range */
 };
 
 /* Global Variables */
@@ -217,7 +218,7 @@ static void do_command_setparam(struct stream_info *si,
 	if (si->connected==FALSE)
 	{
 		dbg(0, "not connected, nothing to do.");
-		send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		//send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 		return;
 	} else {
 		dbg(0, "Connected! Lets do this!");
@@ -228,7 +229,7 @@ static void do_command_setparam(struct stream_info *si,
 
 	if (si->stream[pipeline] == NULL)
 	{
-		send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		//send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 		dbg(0, "ERROR: pipeline element not populated, is there a stream running?");
 		return;
 	}
@@ -239,7 +240,7 @@ static void do_command_setparam(struct stream_info *si,
 
 	if (gstElement == NULL)
 	{
-		send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+		//send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 		dbg(0, "ERROR: Failed getting the element name = %s", elementName);
 	}
 	/* Get pad to set value one*/
@@ -255,7 +256,7 @@ static void do_command_setparam(struct stream_info *si,
 		if(gstPad == NULL)
 		{
 			gst_object_unref(gstElement);
-			send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+			//send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 			dbg(0, "Failed to get static pad %s", padName);
 			return;
 		}
@@ -276,7 +277,7 @@ static void do_command_setparam(struct stream_info *si,
 	{
 		g_object_set_property((GObject*)gstElement, paramName, &param);
 	}
-	send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
+	//send_status_pipe_msg(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
 	/* Finished so unreference the element*/
 	gst_object_unref(gstElement);
 
@@ -466,17 +467,18 @@ static void _do_command_status(const char* functionname, int line, struct stream
 		sprintf(buffer + strlen(buffer), "enable_variable_mode:true,\n");
 
 		sprintf(buffer + strlen(buffer), "steps:%d,\n", si->steps);
-		sprintf(buffer + strlen(buffer), "curr_quant_lvl:%d,\n", si->curr_quant_lvl);
+
 		sprintf(buffer + strlen(buffer), "min_quant_lvl:%d,\n", si->min_quant_lvl);
 		sprintf(buffer + strlen(buffer), "max_quant_lvl:%d,\n", si->max_quant_lvl);
-		sprintf(buffer + strlen(buffer), "curr_bitrate:%d,\n", si->curr_bitrate);
+
 		sprintf(buffer + strlen(buffer), "min_bitrate:%d,\n", si->min_bitrate);
 		sprintf(buffer + strlen(buffer), "max_bitrate:%d,\n", si->max_bitrate);
 
 	} else {
 		sprintf(buffer + strlen(buffer), "enable_variable_mode:false,\n");
 	}
-
+	sprintf(buffer + strlen(buffer), "curr_bitrate:%d,\n", si->curr_bitrate);
+	sprintf(buffer + strlen(buffer), "curr_quant_lvl:%d,\n", si->curr_quant_lvl);
 	sprintf(buffer + strlen(buffer), "periodic_msg_rate:%d", si->msg_rate);
 
 	send_status_pipe_msg(si,"status", buffer);
@@ -615,10 +617,11 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 		GstStructure *stats;
 		g_print("### MSG BLOCK ###\n");
 		g_print("Number of Clients    : %d\n", si->num_cli);
+		g_print("Current Quant Level  : %d\n", si->curr_quant_lvl);
+		g_print("Current Bitrate Level: %d\n", si->curr_bitrate);
 		if (si->enable_variable_mode)
 		{
-			g_print("Current Quant Level  : %d\n", si->curr_quant_lvl);
-			g_print("Current Bitrate Level: %d\n", si->curr_bitrate);
+
 			g_print("Step Factor          : %d\n", (si->max_bitrate) ?
 				((si->max_bitrate - si->min_bitrate) / si->steps) :
 				((si->max_quant_lvl - si->min_quant_lvl) / si->steps));
@@ -674,7 +677,7 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 	{
 		/* Modify imxvpuenc_h264 Properties */
 
-		if (si->enable_variable_mode)
+//		if (si->enable_variable_mode)
 		{
 			g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
 			g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate, NULL);
@@ -682,10 +685,11 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 			g_object_set(si->stream[encoder], "quant-param", si->curr_quant_lvl,
 					 NULL);
 			g_object_set(si->stream[encoder], "idr-interval", si->idr, NULL);
-		} else
-		{
-			dbg(2,"Not setting any encoder properties");
 		}
+//		else
+//		{
+//			dbg(2,"Not setting any encoder properties");
+//		}
 
 	} else {
 		g_printerr("Couldn't get encoder (enc0) pipeline element\n");
@@ -845,8 +849,22 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 	/* Used to initiate the media-configure callback */
 	static gboolean first_run = TRUE;
 
+
 	si->num_cli++;
 	g_print("[%d]A new client has connected\n", si->num_cli);
+
+    GList* sessionList = gst_rtsp_client_session_filter(client, NULL, NULL);
+
+	for (GList* i = sessionList; i != NULL; i = i->next)
+	{
+		const unsigned RTSP_SESSION_TIMEOUT = 10;
+		gst_rtsp_session_set_timeout((GstRTSPSession*)i->data, RTSP_SESSION_TIMEOUT);
+		g_object_unref(i->data);
+	}
+
+	g_list_free(sessionList);
+
+
 	dbg(0, "*************Cliented connected! [%d]", si->num_cli);
 	si->connected = TRUE;
 
@@ -935,6 +953,7 @@ int main (int argc, char *argv[])
 		{"steps",                required_argument, 0,  0 },
 		{"min-bitrate",          required_argument, 0,  0 },
 		{"max-bitrate",          required_argument, 0, 'b'},
+		{"cap-bitrate",          required_argument, 0,  0 },
 		{"max-quant-lvl",        required_argument, 0,  0 },
 		{"min-quant-lvl",        required_argument, 0, 'l'},
 		{"config-interval",      required_argument, 0, 'c'},
@@ -1205,6 +1224,45 @@ int main (int argc, char *argv[])
 		g_printerr("Could not create RTSP server\n");
 		return -ECODE_RTSP;
 	}
+
+
+	  gst_rtsp_media_factory_set_suspend_mode (info.factory, GST_RTSP_SUSPEND_MODE_NONE);
+
+	  info.rtspAddressPool = gst_rtsp_address_pool_new();
+
+	    if (info.rtspAddressPool != NULL)
+	    {
+	        //  If this port range is modified, the firewall forwarding rules will need to be updated to reflect the new
+	        //  range.
+	        const unsigned short RTSP_PORT_RANGE_START = 8999;
+	        const unsigned short RTSP_PORT_RANGE_END = 9098;
+	        const unsigned char RTSP_TTL = 0;
+	        gboolean rangeAded = gst_rtsp_address_pool_add_range(info.rtspAddressPool, GST_RTSP_ADDRESS_POOL_ANY_IPV4, GST_RTSP_ADDRESS_POOL_ANY_IPV4, RTSP_PORT_RANGE_START, RTSP_PORT_RANGE_END, RTSP_TTL);
+
+	        if (rangeAded == TRUE)
+	        {
+	            gst_rtsp_media_factory_set_address_pool(info.factory, info.rtspAddressPool);
+	        }
+	        else
+	        {
+	        	g_printerr("Failed to set RTSP media factory address pool");
+
+	            return -ECODE_RTSP;
+	        }
+	    }
+	    else
+	    {
+	    	g_printerr( "Failed to create RTSP address pool");
+
+	        return -ECODE_RTSP;
+	    }
+
+
+
+
+
+
+
 	/* Share single pipeline with all clients */
 	gst_rtsp_media_factory_set_shared(info.factory, TRUE);
 
@@ -1241,6 +1299,8 @@ int main (int argc, char *argv[])
 	/* setup command pipe if specfied*/
 	if (info.command_pipe!=NULL)
 	{
+		//remove old ones if they exist.
+
 		mkfifo(info.command_pipe, 0666);
 		info.command_pipe_fd = open(info.command_pipe, O_RDONLY | O_NONBLOCK );;
 
@@ -1248,6 +1308,7 @@ int main (int argc, char *argv[])
 		if (info.status_pipe!=NULL)
 		{
 			dbg(4, "Creating status pipe [%s]", info.status_pipe);
+
 			mkfifo(info.status_pipe, 0666);
 
 		}
