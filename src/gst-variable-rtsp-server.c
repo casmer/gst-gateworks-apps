@@ -136,6 +136,10 @@ struct stream_info {
 	gint status_pipe_fd;  /* status-pipe file descriptor */
 	FILE * status_pipe_stream;  /* status-pipe file descriptor */
 	GstRTSPAddressPool* rtspAddressPool; /* Address pool used to restrict the RTSP stream to a known port range */
+	gint rtsp_port_min;  /* start of range for rtp client addres pool. */
+	gint rtsp_port_max;  /* end of range for rtp client addres pool. */
+	gboolean enable_shared_pipeline; /* enable shared pipeline for all clients */
+	gboolean enable_no_suspend; /*  enable no suspend on pipeline */
 };
 
 /* Global Variables */
@@ -929,6 +933,10 @@ int main (int argc, char *argv[])
 		.status_pipe_fd = 0,
 		.status_pipe_stream = NULL,
 		.userpipeline = NULL,
+		.rtsp_port_min = 0,
+		.rtsp_port_max = 0,
+		.enable_shared_pipeline = FALSE,
+		.enable_no_suspend = FALSE,
 
 	};
 
@@ -941,26 +949,30 @@ int main (int argc, char *argv[])
 
 	/* User Arguments */
 	const struct option long_opts[] = {
-		{"help",                 no_argument,       0, '?'},
-		{"version",              no_argument,       0, 'v'},
-		{"debug",                required_argument, 0, 'd'},
-		{"mount-point",          required_argument, 0, 'm'},
-		{"port",                 required_argument, 0, 'p'},
-		{"user-pipeline",        required_argument, 0, 'u'},
-		{"src-element",          required_argument, 0, 's'},
-		{"video-in",             required_argument, 0, 'i'},
-		{"enable-variable-mode", required_argument, 0, 'e' },
-		{"steps",                required_argument, 0,  0 },
-		{"min-bitrate",          required_argument, 0,  0 },
-		{"max-bitrate",          required_argument, 0, 'b'},
-		{"cap-bitrate",          required_argument, 0,  0 },
-		{"max-quant-lvl",        required_argument, 0,  0 },
-		{"min-quant-lvl",        required_argument, 0, 'l'},
-		{"config-interval",      required_argument, 0, 'c'},
-		{"idr",                  required_argument, 0, 'a'},
-		{"msg-rate",             required_argument, 0, 'r'},
-		{"command-pipe",         required_argument, 0,  0 },
-		{"status-pipe",          required_argument, 0,  0 },
+		{"help",                   no_argument,       0, '?'},
+		{"version",                no_argument,       0, 'v'},
+		{"debug",                  required_argument, 0, 'd'},
+		{"mount-point",            required_argument, 0, 'm'},
+		{"port",                   required_argument, 0, 'p'},
+		{"client-port-min",        required_argument, 0,  0 },
+		{"client-port-max",        required_argument, 0,  0 },
+		{"user-pipeline",          required_argument, 0, 'u'},
+		{"src-element",            required_argument, 0, 's'},
+		{"video-in",               required_argument, 0, 'i'},
+		{"enable-variable-mode",   no_argument,       0, 'e' },
+		{"steps",                  required_argument, 0,  0 },
+		{"min-bitrate",            required_argument, 0,  0 },
+		{"max-bitrate",            required_argument, 0, 'b'},
+		{"cap-bitrate",            required_argument, 0,  0 },
+		{"max-quant-lvl",          required_argument, 0,  0 },
+		{"min-quant-lvl",          required_argument, 0, 'l'},
+		{"config-interval",        required_argument, 0, 'c'},
+		{"idr",                    required_argument, 0, 'a'},
+		{"msg-rate",               required_argument, 0, 'r'},
+		{"command-pipe",           required_argument, 0,  0 },
+		{"status-pipe",            required_argument, 0,  0 },
+		{"enable-shared-pipeline", no_argument,       0,  0 },
+		{"enable-no-suspend",      no_argument,       0,  0 },
 		{ /* Sentinel */ }
 	};
 	char *arg_parse = "?hvd:m:p:u:s:i:f:b:l:c:a:r:";
@@ -973,6 +985,10 @@ int main (int argc, char *argv[])
 		" --mount-point,     -m - What URI to mount"
 		" (default: " DEFAULT_MOUNT_POINT ")\n"
 		" --port,            -p - Port to sink on"
+		" --client-port-min     - port range low end for client connections"
+		" --client-port-max     - port range high end for client connections"
+		"                         Must specify a min and a max, otherwise the"
+		"                          program will report an error and exit."
 		" (default: " DEFAULT_PORT ")\n"
 		" --user-pipeline,   -u - User supplied pipeline. Note the\n"
 		"                         below options are NO LONGER"
@@ -981,7 +997,7 @@ int main (int argc, char *argv[])
 		"                         a 'device' property"
 		" (default: " DEFAULT_SRC_ELEMENT ")\n"
 		" --video-in,        -i - Input Device (default: /dev/video0)\n"
-		" --enable-variable-mode   -e - Enable variable bit rate logic, 0 = off, 1 = on \n"
+		" --enable-variable-mode   -e - Enable variable bit rate logic\n"
 		" (default: " DEFAULT_ENABLE_VARIABLE_MODE " \n"
 		" --steps,              - Steps to get to 'worst' quality"
 		" (default: " DEFAULT_STEPS ")\n"
@@ -1001,6 +1017,8 @@ int main (int argc, char *argv[])
 		" (default: 5s, 0 disables)\n\n"
 		" --command-pipe,       - Pipe for pad property commands for IPC"
 		" --status-pipe,        - Pipe for command status replies for IPC"
+		" --enable-shared-pipeline - use a single pipeline for all clients"
+		" --enable-no-suspend   - start pipeline with 'GST_RTSP_SUSPEND_MODE_NONE' set"
 		"Examples:\n"
 		" 1. Capture using imxv4l2videosrc, changes quality:\n"
 		"\tgst-variable-rtsp-server -s imxv4l2videosrc\n"
@@ -1088,6 +1106,27 @@ int main (int argc, char *argv[])
 					info.status_pipe = optarg;
 					dbg(1, "set status pipe to: %s",
 						info.status_pipe);
+			} else if (strcmp(long_opts[opt_ndx].name,
+						 "enable-shared-pipeline") == 0) {
+					info.enable_shared_pipeline = TRUE;
+					dbg(1, "set enable-shared-pipeline to: %d", info.enable_variable_mode);
+					break;
+			} else if (strcmp(long_opts[opt_ndx].name,
+						 "enable-no-suspend") == 0) {
+					info.enable_no_suspend = TRUE;
+					dbg(1, "set enable-no-suspend to: %d", info.enable_variable_mode);
+					break;
+			} else if (strcmp(long_opts[opt_ndx].name,
+						 "client-port-min") == 0) {
+					info.rtsp_port_min = atoi(optarg);
+					dbg(1, "set client-port-min to: %d", info.rtsp_port_min);
+					break;
+			} else if (strcmp(long_opts[opt_ndx].name,
+						 "client-port-max") == 0) {
+					info.rtsp_port_max = atoi(optarg);
+					dbg(1, "set client-port-max to: %d", info.rtsp_port_max);
+					break;
+
 			} else {
 				puts(usage);
 				return -ECODE_ARGS;
@@ -1125,15 +1164,10 @@ int main (int argc, char *argv[])
 			dbg(1, "set video in to: %s", info.video_in);
 			break;
 		case 'e': /* enable-variable-mode */
-			if (atoi(optarg) > 0)
-			{
-				info.enable_variable_mode = TRUE;
-			} else
-			{
-				info.enable_variable_mode = FALSE;
-			}
+			info.enable_variable_mode = TRUE;
 			dbg(1, "set enable-variable-mode to: %d", info.enable_variable_mode);
 			break;
+
 		case 'b': /* Max Bitrate */
 			info.max_bitrate = atoi(optarg);
 			if (info.max_bitrate > atoi(MAX_BR)) {
@@ -1209,6 +1243,25 @@ int main (int argc, char *argv[])
 		return -ECODE_ARGS;
 	}
 
+	if (info.rtsp_port_min > 0 || info.rtsp_port_max > 0)
+	{
+		if (info.rtsp_port_min <=0)
+		{
+			g_printerr("Rtsp Port min not valid. (min:%d)\n", info.rtsp_port_min);
+			return -ECODE_RTSP;
+		}
+		if (info.rtsp_port_max <= 0)
+		{
+			g_printerr("Rtsp Port max not valid. (max:%d)\n", info.rtsp_port_max);
+			return -ECODE_RTSP;
+		}
+		if (info.rtsp_port_max <= info.rtsp_port_min)
+		{
+			g_printerr("Rtsp port max must be greater than Rtsp port min . (min:%d, max:%d)\n", info.rtsp_port_min, info.rtsp_port_max);
+			return -ECODE_RTSP;
+		}
+	}
+
 	/* Configure RTSP */
 	info.server = gst_rtsp_server_new();
 	if (!info.server) {
@@ -1225,47 +1278,44 @@ int main (int argc, char *argv[])
 		return -ECODE_RTSP;
 	}
 
-
+	if (info.enable_no_suspend)
+	{
 	  gst_rtsp_media_factory_set_suspend_mode (info.factory, GST_RTSP_SUSPEND_MODE_NONE);
+	}
+	if (info.rtsp_port_min > 0 || info.rtsp_port_max > 0)
+	{
+		info.rtspAddressPool = gst_rtsp_address_pool_new();
 
-	  info.rtspAddressPool = gst_rtsp_address_pool_new();
+		if (info.rtspAddressPool != NULL)
+		{
+			const unsigned char RTSP_TTL = 0;
+			gboolean rangeAded = gst_rtsp_address_pool_add_range(info.rtspAddressPool,
+					GST_RTSP_ADDRESS_POOL_ANY_IPV4, GST_RTSP_ADDRESS_POOL_ANY_IPV4,
+					info.rtsp_port_min, info.rtsp_port_max, RTSP_TTL);
 
-	    if (info.rtspAddressPool != NULL)
-	    {
-	        //  If this port range is modified, the firewall forwarding rules will need to be updated to reflect the new
-	        //  range.
-	        const unsigned short RTSP_PORT_RANGE_START = 8999;
-	        const unsigned short RTSP_PORT_RANGE_END = 9098;
-	        const unsigned char RTSP_TTL = 0;
-	        gboolean rangeAded = gst_rtsp_address_pool_add_range(info.rtspAddressPool, GST_RTSP_ADDRESS_POOL_ANY_IPV4, GST_RTSP_ADDRESS_POOL_ANY_IPV4, RTSP_PORT_RANGE_START, RTSP_PORT_RANGE_END, RTSP_TTL);
+			if (rangeAded == TRUE)
+			{
+				gst_rtsp_media_factory_set_address_pool(info.factory, info.rtspAddressPool);
+			}
+			else
+			{
+				g_printerr("Failed to set RTSP media factory address pool");
+				return -ECODE_RTSP;
+			}
+		}
+		else
+		{
+			g_printerr( "Failed to create RTSP address pool");
 
-	        if (rangeAded == TRUE)
-	        {
-	            gst_rtsp_media_factory_set_address_pool(info.factory, info.rtspAddressPool);
-	        }
-	        else
-	        {
-	        	g_printerr("Failed to set RTSP media factory address pool");
+			return -ECODE_RTSP;
+		}
+	}
 
-	            return -ECODE_RTSP;
-	        }
-	    }
-	    else
-	    {
-	    	g_printerr( "Failed to create RTSP address pool");
-
-	        return -ECODE_RTSP;
-	    }
-
-
-
-
-
-
-
-	/* Share single pipeline with all clients */
-	gst_rtsp_media_factory_set_shared(info.factory, TRUE);
-
+	if (info.enable_shared_pipeline)
+	{
+		/* Share single pipeline with all clients */
+		gst_rtsp_media_factory_set_shared(info.factory, TRUE);
+	}
 	/* Source Pipeline */
 	if (info.userpipeline)
 		snprintf(launch, LAUNCH_MAX, "( %s )", info.userpipeline);
