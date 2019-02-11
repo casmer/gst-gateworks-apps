@@ -1,34 +1,32 @@
 /**
- * Copyright (C) 2015 Pushpal Sidhu <psidhu@gateworks.com>
+ * Copyright (C) 2019 Casey Gregoire <caseyg@lalosoft.com>
  *
  * Filename: gst-variable-rtsp-server.c
- * Author: Pushpal Sidhu <psidhu@gateworks.com>
- * Created: Tue May 19 14:29:23 2015 (-0700)
- * Version: 1.0
- * Last-Updated: Fri Jan 15 14:22:59 2016 (-0800)
- *           By: Pushpal Sidhu
+ * Author: Casey Gregoire <caseyg@lalosoft.com>
+ * Version: 1.5
+ *           By: Casey Gregoire
  *
  * Compatibility: ARCH=arm && proc=imx6
  */
 
 /**
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or (at
- * your option) any later version.
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 3 of the License, or (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with gst-variable-rtsp-server. If not, see
- * <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
 #ifndef VERSION
-#define VERSION "1.4"
+#define VERSION "1.5"
 #endif
 
 #include <ecode.h>
@@ -1349,7 +1347,8 @@ int main (int argc, char *argv[])
 	/* setup command pipe if specfied*/
 	if (info.command_pipe!=NULL)
 	{
-		//remove old ones if they exist.
+		//do not remove old ones if they exist, expect the creating process to do this
+		//so it can open the pipe.
 
 		mkfifo(info.command_pipe, 0666);
 		info.command_pipe_fd = open(info.command_pipe, O_RDONLY | O_NONBLOCK );;
