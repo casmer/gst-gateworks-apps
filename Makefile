@@ -123,7 +123,8 @@ endef
 # Add App Targets here
 gst-variable-rtsp-server: $(GST_VARIABLE_RTSP_SERVER_OBJS)
 	$(call dbg-link,"gst-variable-rtsp-server")
-
+	
+	
 .PHONY: clean tags etags
 clean:
 ifdef V
