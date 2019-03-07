@@ -210,7 +210,7 @@ void _dbg(const char *func, unsigned int line,
 
 static void setupStatusPipeIfNeeded(struct StreamInfo *si)
 {
-    if (si->statusPipe != NULL && si->statusPipeFd ==0)
+    if (si->statusPipe != NULL && si->statusPipeFd ==-1)
     {
         dbg(4, "opening status pipe ");
         si->statusPipeFd = open(si->statusPipe, O_WRONLY );
@@ -251,9 +251,11 @@ static void sendStatusPipeMessage(struct StreamInfo *si,
     }
     else
     {
-        printf("status-reply: {");
-        vprintf(fmt, ap);
-        printf("}");
+        printf("status-reply: {\n");
+        printf( "msg{\ntype:%s,\ndata:{\n", messageType);
+        vprintf( fmt, ap);
+        printf( "\n}}\n");
+        printf("\n}\n");
         fflush(stdout);
     }
 
