@@ -109,6 +109,8 @@
 #define MSG_T_ELEMENTPROPS "elementprops"
 ///string literal for status command
 #define MSG_T_STATUS "status"
+///represents no file for fd variables.
+#define NO_FILE -1
 
 /**
  * Source and Sink must always be positioned as such. Elements can be added
@@ -210,7 +212,7 @@ void _dbg(const char *func, unsigned int line,
 
 static void setupStatusPipeIfNeeded(struct StreamInfo *si)
 {
-    if (si->statusPipe != NULL && si->statusPipeFd ==-1)
+    if (si->statusPipe != NULL && si->statusPipeFd == NO_FILE)
     {
         dbg(4, "opening status pipe ");
         si->statusPipeFd = open(si->statusPipe, O_WRONLY );
@@ -279,7 +281,6 @@ static void doCommandSetParameter(struct StreamInfo *si,
     if (si->connected==FALSE)
     {
         dbg(0, "not connected, nothing to do.");
-        //sendStatusPipeMessage(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
         return;
     }
     else
@@ -292,7 +293,6 @@ static void doCommandSetParameter(struct StreamInfo *si,
 
     if (si->stream[pipeline] == NULL)
     {
-        //sendStatusPipeMessage(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
         dbg(0, "ERROR: pipeline element not populated, is there a stream running?");
         return;
     }
@@ -303,7 +303,6 @@ static void doCommandSetParameter(struct StreamInfo *si,
 
     if (gstElement == NULL)
     {
-        //sendStatusPipeMessage(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
         dbg(0, "ERROR: Failed getting the element name = %s", elementName);
     }
     // Get pad to set value one
@@ -321,7 +320,6 @@ static void doCommandSetParameter(struct StreamInfo *si,
         if(gstPad == NULL)
         {
             gst_object_unref(gstElement);
-            //sendStatusPipeMessage(si, MSG_T_SETPARAM, "%s:%s:%s:%s:not streaming", elementName, padName, paramName, paramValue);
             dbg(0, "Failed to get static pad %s", padName);
             return;
         }
@@ -1065,8 +1063,8 @@ int main (int argc, char *argv[])
         .periodicStatusMessageRate = 5,
         .commandPipe = NULL,
         .statusPipe = NULL,
-        .commandPipeFd = -1,
-        .statusPipeFd = -1,
+        .commandPipeFd = NO_FILE,
+        .statusPipeFd = NO_FILE,
         .statusPipeStream = NULL,
         .userpipeline = NULL,
         .rtspPortMin = 0,
